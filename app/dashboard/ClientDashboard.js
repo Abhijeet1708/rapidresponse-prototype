@@ -192,6 +192,11 @@ export default function ClientDashboard({ initialIncidents, reportUrl }) {
   const [incidents, setIncidents] = useState(initialIncidents);
   const [qrCodeDataUrl, setQrCodeDataUrl] = useState('');
   const [expandedId, setExpandedId] = useState(null);
+  
+  // Polish & Hardening States
+  const [toast, setToast] = useState(null);
+  const [isReconnecting, setIsReconnecting] = useState(false);
+  const [isRefreshing, setIsRefreshing] = useState(false);
 
   useEffect(() => {
     QRCode.toDataURL(reportUrl, {
@@ -200,22 +205,58 @@ export default function ClientDashboard({ initialIncidents, reportUrl }) {
       color: { dark: '#000000', light: '#ffffff' }
     }).then(url => setQrCodeDataUrl(url)).catch(err => console.error(err));
 
+    let reconnectTimer;
+
     const channel = supabase
       .channel('dashboard-incidents')
       .on(
         'postgres_changes',
         { event: 'INSERT', schema: 'public', table: 'incidents' },
-        (payload) => setIncidents(prev => [payload.new, ...prev])
+        (payload) => {
+          setIncidents(prev => [payload.new, ...prev]);
+          showToast(`New incident reported: ${payload.new.reference_code}`);
+        }
       )
       .on(
         'postgres_changes',
         { event: 'UPDATE', schema: 'public', table: 'incidents' },
         (payload) => setIncidents(prev => prev.map(inc => inc.id === payload.new.id ? payload.new : inc))
       )
-      .subscribe();
+      .subscribe((status) => {
+        if (status === 'SUBSCRIBED') {
+          setIsReconnecting(false);
+          clearTimeout(reconnectTimer);
+        } else if (status === 'CLOSED' || status === 'CHANNEL_ERROR') {
+          setIsReconnecting(true);
+          // Supabase Realtime auto-reconnects, but we'll show UI and try manual re-fetch after 5s
+          reconnectTimer = setTimeout(() => {
+            handleRefresh();
+          }, 5000);
+        }
+      });
 
-    return () => supabase.removeChannel(channel);
+    return () => {
+      supabase.removeChannel(channel);
+      clearTimeout(reconnectTimer);
+    };
   }, [reportUrl]);
+
+  const showToast = (message) => {
+    setToast(message);
+    setTimeout(() => setToast(null), 5000);
+  };
+
+  const handleRefresh = async () => {
+    setIsRefreshing(true);
+    try {
+      const { data } = await supabase.from('incidents').select('*').order('created_at', { ascending: false });
+      if (data) setIncidents(data);
+    } catch (err) {
+      console.error('Refresh error', err);
+    } finally {
+      setIsRefreshing(false);
+    }
+  };
 
   const handleSignOut = async () => {
     await fetch('/api/auth/logout', { method: 'POST' });
@@ -244,7 +285,29 @@ export default function ClientDashboard({ initialIncidents, reportUrl }) {
   };
 
   return (
-    <div className="min-h-[100dvh] flex flex-col bg-[#050505]">
+    <div className="min-h-[100dvh] flex flex-col bg-[#050505] relative">
+      
+      {/* Toast Notification */}
+      <div className={`fixed top-24 left-1/2 -translate-x-1/2 z-50 premium-transition ${toast ? 'opacity-100 translate-y-0' : 'opacity-0 -translate-y-4 pointer-events-none'}`}>
+        <div className="bg-amber-500/90 text-black px-6 py-3 rounded-full shadow-2xl backdrop-blur-md flex items-center space-x-3 font-medium">
+          <span className="text-xl">🚨</span>
+          <span>{toast}</span>
+        </div>
+      </div>
+
+      {/* Error Boundary / Reconnecting Overlay */}
+      {isReconnecting && (
+        <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-50">
+          <div className="bg-red-500/90 text-white px-6 py-3 rounded-full shadow-2xl backdrop-blur-md flex items-center space-x-3 font-medium text-sm">
+            <svg className="animate-spin h-4 w-4 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+              <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+              <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+            </svg>
+            <span>Connection lost. Reconnecting...</span>
+          </div>
+        </div>
+      )}
+
       <nav className="w-full bg-[#0B1F3A]/40 backdrop-blur-3xl border-b border-white/5 sticky top-0 z-50">
         <div className="max-w-7xl mx-auto px-4 md:px-8 h-20 flex items-center justify-between">
           <div className="flex items-center space-x-6">
@@ -254,7 +317,17 @@ export default function ClientDashboard({ initialIncidents, reportUrl }) {
               <span className="text-[10px] uppercase tracking-[0.2em] text-green-400 font-medium">System Online</span>
             </div>
           </div>
-          <div className="flex items-center space-x-6">
+          <div className="flex items-center space-x-4 md:space-x-6">
+            <button 
+              onClick={handleRefresh}
+              disabled={isRefreshing}
+              className="text-white/50 hover:text-white premium-transition p-2 bg-white/5 hover:bg-white/10 rounded-full"
+              title="Manual Refresh"
+            >
+              <svg className={`w-5 h-5 ${isRefreshing ? 'animate-spin' : ''}`} fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+              </svg>
+            </button>
             {qrCodeDataUrl && (
               <div className="hidden sm:flex items-center space-x-3 bg-white/5 rounded-2xl p-2 border border-white/5">
                 <img src={qrCodeDataUrl} alt="Report QR Code" className="w-10 h-10 rounded-lg" />
